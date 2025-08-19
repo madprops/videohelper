@@ -71,9 +71,9 @@ def pitch_media(input_file, percentage, output_file):
     # Check if input has video stream
     has_video = check_has_video_stream(input_file)
 
-    # Force audio-only processing if output is MP3 (MP3 can't contain video)
-    output_is_mp3 = output_file.lower().endswith('.mp3')
-    process_as_video = has_video and not output_is_mp3
+    # Force audio-only processing if output is MP3 or FLAC (these formats can't contain video)
+    output_is_audio_only = output_file.lower().endswith(('.mp3', '.flac'))
+    process_as_video = has_video and not output_is_audio_only
 
     if process_as_video:
         # Video file processing
@@ -89,14 +89,24 @@ def pitch_media(input_file, percentage, output_file):
             output_file
         ]
     else:
-        # Audio-only file processing (or video input with MP3 output)
-        if output_is_mp3:
+        # Audio-only file processing (or video input with MP3/FLAC output)
+        if output_file.lower().endswith('.mp3'):
             cmd = [
                 'ffmpeg',
                 '-i', input_file,
                 '-filter:a', f'asetrate=44100*{speed_factor},aresample=44100',
                 '-c:a', 'libmp3lame',
                 '-b:a', '192k',  # Set bitrate for MP3
+                '-y',  # Overwrite output file if it exists
+                output_file
+            ]
+        elif output_file.lower().endswith('.flac'):
+            cmd = [
+                'ffmpeg',
+                '-i', input_file,
+                '-filter:a', f'asetrate=44100*{speed_factor},aresample=44100',
+                '-c:a', 'flac',
+                '-compression_level', '5',  # FLAC compression level (0-12, 5 is balanced)
                 '-y',  # Overwrite output file if it exists
                 output_file
             ]
@@ -111,8 +121,8 @@ def pitch_media(input_file, percentage, output_file):
             ]
 
     print(f"Processing {'video' if process_as_video else 'audio'}: {input_file}")
-    if has_video and output_is_mp3:
-        print("Note: Extracting audio only (MP3 output cannot contain video)")
+    if has_video and output_is_audio_only:
+        print(f"Note: Extracting audio only ({output_file.split('.')[-1].upper()} output cannot contain video)")
     print(f"Speed: {percentage}% (pitch will be {'lower' if percentage < 100 else 'higher' if percentage > 100 else 'unchanged'})")
     print(f"Output: {output_file}")
     print("Running ffmpeg...")
@@ -147,7 +157,7 @@ def main():
     if len(sys.argv) != 4:
         print("Usage: python pitcher.py <input_file> <percentage> <output_file>")
         print("\nArguments:")
-        print("  input_file  - Path to the input video or audio file (supports MP4, AVI, MKV, MP3, WAV, etc.)")
+        print("  input_file  - Path to the input video or audio file (supports MP4, AVI, MKV, MP3, WAV, FLAC, etc.)")
         print("  percentage  - Speed percentage (e.g., 70 for 70% speed, lower pitch)")
         print("  output_file - Path to the output video or audio file")
         print("\nExamples:")
@@ -155,7 +165,8 @@ def main():
         print("  python pitcher.py input.avi 50 half_speed.mp4")
         print("  python pitcher.py movie.mkv 130 fast_movie.mp4")
         print("  python pitcher.py song.mp3 80 slow_song.mp3")
-        print("  python pitcher.py audio.wav 120 fast_audio.mp3")
+        print("  python pitcher.py audio.wav 120 fast_audio.flac")
+        print("  python pitcher.py music.flac 90 slower_music.flac")
         sys.exit(1)
 
     input_file = sys.argv[1]
