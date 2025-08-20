@@ -152,90 +152,100 @@ def pitch_media(input_file, percentage, output_file, add_reverb=False):
     output_is_audio_only = output_file.lower().endswith(('.mp3', '.flac'))
     process_as_video = has_video and not output_is_audio_only
 
-    # Build audio filter chain
-    audio_filters = f'asetrate=44100*{speed_factor},aresample=44100'
+    # Base (simple) audio speed/pitch change chain
+    base_audio_chain = f'asetrate=44100*{speed_factor},aresample=44100'
 
+    # Track whether we need a complex (multi-pad) graph
+    complex_audio_graph = None  # Will hold only the audio portion if needed
     impulse_file = None
+
     if add_reverb:
         print("Adding reverb effect...")
-        # Try to create sophisticated impulse response
         impulse_file = create_impulse_response_file()
-
         if impulse_file:
-            # Use convolution reverb with pre-delay, filtering, and compression
-            # This closely matches the JavaScript implementation
-            reverb_chain = (
-                f'afifo,'  # Buffer for processing
-                f'adelay=30|30,'  # Pre-delay (30ms like JS)
-                f'lowpass=f=6500:width_type=h:width=0.707,'  # Low-pass filter (6.5kHz, Q=0.707)
-                f'aconvolve={impulse_file},'  # Convolution with custom impulse
-                f'acompressor=threshold=-18dB:ratio=2:attack=3:release=250,'  # Dynamic compression
-                f'volume=0.55'  # Wet level (55% mix like JS default)
+            # Build complex graph with dry/wet mix using convolution reverb using afir (load IR via amovie)
+            # Graph explanation:
+            # 1. [0:a] speed change then split -> [prewet][dry]
+            # 2. Load impulse file with amovie -> [ir]
+            # 3. Convolve: [prewet][ir] afir -> [wetraw]
+            # 4. Apply pre-delay + filtering + compression + level -> [wet]
+            # 5. Mix dry & wet -> [a]
+            complex_audio_graph = (
+                f"[0:a]{base_audio_chain},asplit=2[prewet][dry];"
+                f"amovie={impulse_file}[ir];"
+                f"[prewet][ir]afir=dry=0:wet=1[wetraw];"
+                f"[wetraw]adelay=30|30,lowpass=f=6500:width_type=h:width=0.707,"
+                f"acompressor=threshold=-18dB:ratio=2:attack=3:release=250,volume=0.55[wet];"
+                f"[dry][wet]amix=inputs=2:weights=0.45|0.55[a]"
             )
-
-            # Mix dry and wet signals
-            audio_filters += f'[wet];[0:a]asetrate=44100*{speed_factor},aresample=44100[dry];[dry][wet]amix=inputs=2:weights=0.45 0.55'
         else:
-            # Fallback to enhanced echo effect if impulse response creation fails
-            audio_filters += ',aecho=0.8:0.9:30:0.3,aecho=0.6:0.7:60:0.2,lowpass=f=6500'
+            # Fallback to simple echo chain (can stay linear)
+            base_audio_chain += ',aecho=0.8:0.9:30:0.3,aecho=0.6:0.7:60:0.2,lowpass=f=6500'
+    # If no reverb requested, base_audio_chain is sufficient
 
+    # Build command
     if process_as_video:
-        # Video file processing
+        # Always use -filter_complex for video so we can integrate either simple or complex audio graph uniformly
+        if complex_audio_graph:
+            filter_complex = f"[0:v]setpts={1/speed_factor}*PTS[v];" + complex_audio_graph
+        else:
+            # Simple case: append audio chain and label output [a]
+            filter_complex = f"[0:v]setpts={1/speed_factor}*PTS[v];[0:a]{base_audio_chain}[a]"
+        # Optional debug output
+        if os.environ.get('PITCHER_DEBUG'):
+            print('Filter complex:', filter_complex)
         cmd = [
             'ffmpeg',
             '-i', input_file,
-            '-filter_complex', f'[0:v]setpts={1/speed_factor}*PTS[v];[0:a]{audio_filters}[a]',
+            '-filter_complex', filter_complex,
             '-map', '[v]',
             '-map', '[a]',
             '-c:v', 'libx264',
             '-c:a', 'aac',
-            '-y',  # Overwrite output file if it exists
+            '-y',
             output_file
         ]
     else:
-        # Audio-only file processing (or video input with MP3/FLAC output)
-        if output_file.lower().endswith('.mp3'):
+        # Audio-only output
+        if complex_audio_graph:
+            # Need -filter_complex and map [a]
+            if os.environ.get('PITCHER_DEBUG'):
+                print('Filter complex:', complex_audio_graph)
             cmd = [
                 'ffmpeg',
                 '-i', input_file,
-                '-filter:a', audio_filters,
-                '-c:a', 'libmp3lame',
-                '-b:a', '192k',  # Set bitrate for MP3
-                '-y',  # Overwrite output file if it exists
-                output_file
-            ]
-        elif output_file.lower().endswith('.flac'):
-            cmd = [
-                'ffmpeg',
-                '-i', input_file,
-                '-filter:a', audio_filters,
-                '-c:a', 'flac',
-                '-compression_level', '5',  # FLAC compression level (0-12, 5 is balanced)
-                '-y',  # Overwrite output file if it exists
-                output_file
+                '-filter_complex', complex_audio_graph,
+                '-map', '[a]',
             ]
         else:
+            # Simple linear chain can use -filter:a
+            if os.environ.get('PITCHER_DEBUG'):
+                print('Filter a:', base_audio_chain)
             cmd = [
                 'ffmpeg',
                 '-i', input_file,
-                '-filter:a', audio_filters,
-                '-c:a', 'aac',
-                '-y',  # Overwrite output file if it exists
-                output_file
+                '-filter:a', base_audio_chain,
             ]
+        # Append codec options based on output extension
+        if output_file.lower().endswith('.mp3'):
+            cmd += ['-c:a', 'libmp3lame', '-b:a', '192k']
+        elif output_file.lower().endswith('.flac'):
+            cmd += ['-c:a', 'flac', '-compression_level', '5']
+        else:
+            cmd += ['-c:a', 'aac']
+        cmd += ['-y', output_file]
 
     print(f"Processing {'video' if process_as_video else 'audio'}: {input_file}")
     if has_video and output_is_audio_only:
         print(f"Note: Extracting audio only ({output_file.split('.')[-1].upper()} output cannot contain video)")
     print(f"Speed: {percentage}% (pitch will be {'lower' if percentage < 100 else 'higher' if percentage > 100 else 'unchanged'})")
     if add_reverb:
-        print("Reverb: Enabled (room-like echo effect)")
+        print(f"Reverb: {'Enabled (convolution)' if impulse_file else 'Enabled (echo fallback)'}")
     print(f"Output: {output_file}")
     print("Running ffmpeg...")
 
     try:
-        # Run ffmpeg with progress output
-        result = subprocess.run(cmd, check=True, text=True, capture_output=False)
+        subprocess.run(cmd, check=True, text=True, capture_output=False)
         effects_text = " with reverb" if add_reverb else ""
         print(f"\nSuccess! {'Video' if process_as_video else 'Audio'} processed{effects_text} and saved to: {output_file}")
 
@@ -249,7 +259,6 @@ def pitch_media(input_file, percentage, output_file, add_reverb=False):
         sys.exit(1)
     except KeyboardInterrupt:
         print("\nOperation cancelled by user")
-        # Clean up incomplete output file
         if os.path.exists(output_file):
             try:
                 os.remove(output_file)
@@ -258,7 +267,6 @@ def pitch_media(input_file, percentage, output_file, add_reverb=False):
                 pass
         sys.exit(1)
     finally:
-        # Clean up temporary impulse response file
         if impulse_file and os.path.exists(impulse_file):
             try:
                 os.unlink(impulse_file)
